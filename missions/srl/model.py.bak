@@ -1,0 +1,849 @@
+# -*-encoding:utf-8-*-
+from __future__ import division
+
+from functools import reduce
+from operator import mul
+
+import sys
+import math
+import numpy as np
+import tensorflow as tf
+from tensorflow.contrib.crf import crf_log_likelihood
+from tensorflow.contrib.crf import viterbi_decode
+
+from model_utils import result_to_json
+
+from bert_model import BertModel, BertConfig
+
+
+def deep_bidirectional_dynamic_rnn(cells, inputs, sequence_length, scope):
+    def _reverse(_input, seq_lengths):
+        return tf.reverse_sequence(input=_input, seq_lengths=seq_lengths, seq_axis=1, batch_dim=0)
+
+    outputs, state = None, None
+    with tf.variable_scope("dblstm-" + scope):
+        for i, cell in enumerate(cells):
+            if i % 2 == 1:
+                with tf.variable_scope("bw-%s" % (i // 2)) as bw_scope:
+                    inputs_reverse = _reverse(inputs, seq_lengths=sequence_length)
+                    outputs, state = tf.nn.dynamic_rnn(cell=cell, inputs=inputs_reverse,
+                                                       sequence_length=sequence_length,
+                                                       dtype=tf.float32, scope=bw_scope)
+                    outputs = _reverse(outputs, seq_lengths=sequence_length)
+            else:
+                with tf.variable_scope("fw-%s" % (i // 2)) as fw_scope:
+                    outputs, state = tf.nn.dynamic_rnn(cell=cell, inputs=inputs, sequence_length=sequence_length,
+                                                       dtype=tf.float32, scope=fw_scope)
+            inputs = outputs
+    return outputs, state
+
+
+def _dynamic_rnn(cell, inputs, sequence_length, direction, time_major=False,
+                 parallel_iterations=None, swap_memory=True, dtype=None):
+    if time_major:
+        batch_axis = 1
+        seq_axis = 0
+    else:
+        batch_axis = 0
+        seq_axis = 1
+
+    if direction == "backward":
+        inputs = tf.reverse_sequence(inputs, sequence_length,
+                                     seq_axis=seq_axis, batch_axis=batch_axis)
+
+    outputs, final_state = tf.nn.dynamic_rnn(
+        cell,
+        inputs,
+        sequence_length=sequence_length,
+        initial_state=None,
+        dtype=dtype or inputs.dtype,
+        parallel_iterations=parallel_iterations,
+        swap_memory=swap_memory,
+        time_major=time_major,
+        scope=direction
+    )
+
+    if direction == "backward":
+        outputs = tf.reverse_sequence(outputs, sequence_length,
+                                      seq_axis=seq_axis, batch_axis=batch_axis)
+
+    return outputs
+
+
+class FFN:
+    """FFN class (Position-wise Feed-Forward Networks)"""
+
+    def __init__(self,
+                 w1_dim=200,
+                 w2_dim=100,
+                 dropout=0.1):
+        self.w1_dim = w1_dim
+        self.w2_dim = w2_dim
+        self.dropout = dropout
+
+    def dense_relu_dense(self, inputs):
+        output = tf.layers.dense(inputs, self.w1_dim, activation=tf.nn.relu)
+        output = tf.layers.dense(output, self.w2_dim)
+
+        return tf.nn.dropout(output, self.dropout)
+
+    def conv_relu_conv(self):
+        raise NotImplementedError("i will implement it!")
+
+
+class Attention:
+    """Attention class"""
+
+    def __init__(self,
+                 num_heads=8,
+                 masked=False,
+                 linear_key_dim=128,
+                 linear_value_dim=128,
+                 model_dim=128,
+                 dropout=0.5):
+        assert linear_key_dim % num_heads == 0
+        assert linear_value_dim % num_heads == 0
+
+        self.num_heads = num_heads
+        self.masked = masked
+        self.linear_key_dim = linear_key_dim
+        self.linear_value_dim = linear_value_dim
+        self.model_dim = model_dim
+        self.dropout = dropout
+
+    def multi_head(self, q, k, v):
+        q, k, v = self._linear_projection(q, k, v)
+        qs, ks, vs = self._split_heads(q, k, v)
+        outputs = self._scaled_dot_product(qs, ks, vs)
+        output = self._concat_heads(outputs)
+        output = tf.layers.dense(output, self.model_dim)
+        return tf.nn.dropout(output, self.dropout)
+
+    def _linear_projection(self, q, k, v):
+        q = tf.layers.dense(q, self.linear_key_dim, use_bias=False)
+        k = tf.layers.dense(k, self.linear_key_dim, use_bias=False)
+        v = tf.layers.dense(v, self.linear_value_dim, use_bias=False)
+        return q, k, v
+
+    def _split_heads(self, q, k, v):
+        def split_last_dimension_then_transpose(tensor, num_heads, dim):
+            t_shape = tensor.get_shape().as_list()
+            tensor = tf.reshape(tensor, [-1] + t_shape + [num_heads, dim // num_heads])
+            return tf.transpose(tensor, [0, 2, 1, 3])  # [batch_size, num_heads, max_seq_len, dim]
+
+        qs = split_last_dimension_then_transpose(q, self.num_heads, self.linear_key_dim)
+        ks = split_last_dimension_then_transpose(k, self.num_heads, self.linear_key_dim)
+        vs = split_last_dimension_then_transpose(v, self.num_heads, self.linear_value_dim)
+        return qs, ks, vs
+
+    def _scaled_dot_product(self, qs, ks, vs):
+        key_dim_per_head = self.linear_key_dim // self.num_heads
+
+        o1 = tf.matmul(qs, ks, transpose_b=True)
+        o2 = o1 / (key_dim_per_head ** 0.5)
+
+        if self.masked:
+            diag_vals = tf.ones_like(o2[0, 0, :, :])  # (batch_size, num_heads, query_dim, key_dim)
+            tril = tf.linalg.LinearOperatorLowerTriangular(diag_vals).to_dense()  # (q_dim, k_dim)
+            masks = tf.tile(tf.reshape(tril, [1, 1] + tril.get_shape().as_list()),
+                            [tf.shape(o2)[0], tf.shape(o2)[1], 1, 1])
+            paddings = tf.ones_like(masks) * -1e9
+            o2 = tf.where(tf.equal(masks, 0), paddings, o2)
+
+        o3 = tf.nn.softmax(o2)
+        return tf.matmul(o3, vs)
+
+    def _concat_heads(self, outputs):
+        def transpose_then_concat_last_two_dimenstion(tensor):
+            tensor = tf.transpose(tensor, [0, 2, 1, 3])  # [batch_size, max_seq_len, num_heads, dim]
+            t_shape = tensor.get_shape().as_list()
+            num_heads, dim = t_shape[-2:]
+            return tf.reshape(tensor, [-1] + t_shape[1:-2] + [num_heads * dim])
+
+        return transpose_then_concat_last_two_dimenstion(outputs)
+
+
+class Encoder:
+    """Encoder class"""
+
+    def __init__(self,
+                 num_layers=6,
+                 num_heads=8,
+                 linear_key_dim=256,
+                 linear_value_dim=256,
+                 model_dim=256,
+                 ffn_dim=256,
+                 dropout=0.5):
+        self.num_layers = num_layers
+        self.num_heads = num_heads
+        self.linear_key_dim = linear_key_dim
+        self.linear_value_dim = linear_value_dim
+        self.model_dim = model_dim
+        self.ffn_dim = ffn_dim
+        self.dropout = dropout
+
+    def build(self, encoder_inputs):
+        o1 = tf.identity(encoder_inputs)
+
+        for i in range(1, self.num_layers + 1):
+            with tf.variable_scope(f"layer-{i}"):
+                o2 = self._add_and_norm(o1, self._self_attention(q=o1,
+                                                                 k=o1,
+                                                                 v=o1), num=1)
+                o3 = self._add_and_norm(o2, self._positional_feed_forward(o2), num=2)
+                o1 = tf.identity(o3)
+
+        return o3
+
+    def _self_attention(self, q, k, v):
+        with tf.variable_scope("self-attention"):
+            attention = Attention(num_heads=self.num_heads,
+                                  masked=False,
+                                  linear_key_dim=self.linear_key_dim,
+                                  linear_value_dim=self.linear_value_dim,
+                                  model_dim=self.model_dim,
+                                  dropout=self.dropout)
+            return attention.multi_head(q, k, v)
+
+    @staticmethod
+    def _add_and_norm(x, sub_layer_x, num=0):
+        with tf.variable_scope(f"add-and-norm-{num}"):
+            return tf.contrib.layers.layer_norm(tf.add(x, sub_layer_x))  # with Residual connection
+
+    def _positional_feed_forward(self, output):
+        with tf.variable_scope("feed-forward"):
+            ffn = FFN(w1_dim=self.ffn_dim,
+                      w2_dim=self.model_dim,
+                      dropout=self.dropout)
+            return ffn.dense_relu_dense(output)
+
+
+class Decoder:
+    """Decoder class"""
+
+    def __init__(self,
+                 num_layers=8,
+                 num_heads=8,
+                 linear_key_dim=256,
+                 linear_value_dim=256,
+                 model_dim=256,
+                 ffn_dim=256,
+                 dropout=0.5):
+        self.num_layers = num_layers
+        self.num_heads = num_heads
+        self.linear_key_dim = linear_key_dim
+        self.linear_value_dim = linear_value_dim
+        self.model_dim = model_dim
+        self.ffn_dim = ffn_dim
+        self.dropout = dropout
+
+    def build(self, decoder_inputs, encoder_outputs):
+        o1 = tf.identity(decoder_inputs)
+
+        for i in range(1, self.num_layers + 1):
+            with tf.variable_scope(f"layer-{i}"):
+                o2 = self._add_and_norm(o1, self._masked_self_attention(q=o1,
+                                                                        k=o1,
+                                                                        v=o1), num=1)
+                o3 = self._add_and_norm(o2, self._encoder_decoder_attention(q=o2,
+                                                                            k=encoder_outputs,
+                                                                            v=encoder_outputs), num=2)
+                o4 = self._add_and_norm(o3, self._positional_feed_forward(o3), num=3)
+                o1 = tf.identity(o4)
+
+        return o4
+
+    def _masked_self_attention(self, q, k, v):
+        with tf.variable_scope("masked-self-attention"):
+            attention = Attention(num_heads=self.num_heads,
+                                  masked=True,  # Not implemented yet
+                                  linear_key_dim=self.linear_key_dim,
+                                  linear_value_dim=self.linear_value_dim,
+                                  model_dim=self.model_dim,
+                                  dropout=self.dropout)
+            return attention.multi_head(q, k, v)
+
+    def _add_and_norm(self, x, sub_layer_x, num=0):
+        with tf.variable_scope(f"add-and-norm-{num}"):
+            return tf.contrib.layers.layer_norm(tf.add(x, sub_layer_x))  # with Residual connection
+
+    def _encoder_decoder_attention(self, q, k, v):
+        with tf.variable_scope("encoder-decoder-attention"):
+            attention = Attention(num_heads=self.num_heads,
+                                  masked=False,
+                                  linear_key_dim=self.linear_key_dim,
+                                  linear_value_dim=self.linear_value_dim,
+                                  model_dim=self.model_dim,
+                                  dropout=self.dropout)
+            return attention.multi_head(q, k, v)
+
+    def _positional_feed_forward(self, output):
+        with tf.variable_scope("feed-forward"):
+            ffn = FFN(w1_dim=self.ffn_dim,
+                      w2_dim=self.model_dim,
+                      dropout=self.dropout)
+            return ffn.dense_relu_dense(output)
+
+
+class Model(object):
+
+    def __init__(self, config):
+
+        self.config = config
+        self.lr = config["lr"]
+        self.char_dim = config["char_dim"]
+        self.char_lstm_dim = config["char_lstm_dim"]
+        self.word_lstm_dim = config["word_lstm_dim"]
+
+        self.num_tags = config["num_tags"]
+        self.num_chars = config["num_chars"]
+
+        self.global_step = tf.Variable(0, trainable=False)
+        self.best_dev_f1 = tf.Variable(0.0, trainable=False)
+        self.best_test_f1 = tf.Variable(0.0, trainable=False)
+
+        self.seed = 1337
+
+        tf.set_random_seed(self.seed)
+
+        self.l2_reg = tf.contrib.layers.l2_regularizer(5e-4)
+        self.he_uni = tf.contrib.layers.variance_scaling_initializer(factor=3., mode='FAN_AVG', uniform=True)
+
+        self.char_lookup = None
+
+        self.num_layers = 6
+        self.num_heads = 8
+        self.linear_key_dim = 256
+        self.linear_value_dim = 256
+        self.ffn_dim = 256
+
+        # add placeholders for the model
+
+        self.char_inputs = tf.placeholder(dtype=tf.int32,
+                                          # [batch, word_in_sen, char_in_word]
+                                          shape=[None, None, self.config["max_char_length"]],
+                                          name="CharInputs")
+        self.targets = tf.placeholder(dtype=tf.int32, shape=[None, None],
+                                      name="Targets")
+
+        # dropout keep prob
+        self.dropout = tf.placeholder(dtype=tf.float32, name="Dropout")
+
+        used = tf.sign(tf.abs(self.char_inputs))  # 존재하는 곳에 1인 mask
+        char_length = tf.reduce_sum(used, reduction_indices=2)
+        word_length = tf.reduce_sum(tf.sign(char_length), reduction_indices=1)
+        self.word_lengths = tf.cast(word_length, tf.int32)
+        self.batch_size = tf.shape(self.char_inputs)[0]
+        self.word_num_steps = tf.shape(self.char_inputs)[-2]
+
+        # decode_inputs = tf.concat((tf.ones_like(self.targets[:, :1]) * 2, self.targets[:, :-1]), -1)
+        # print("[*] Decoder inputs : ", decode_inputs.get_shape().as_list())
+
+        # embeddings for chinese character and segmentation representation
+        char_embedding = self.embedding_layer(self.char_inputs, self.num_chars, self.char_dim)
+
+        # apply dropout before feed to lstm layer
+        char_embedding = tf.nn.dropout(char_embedding, self.dropout)
+        # print("[*] char_embedding size : ", char_embedding.get_shape().as_list())
+
+        # position-encoding
+        word_encoded = self.get_word_representation(char_embedding)
+        print("[*] word encoded size : ", word_encoded.get_shape().as_list())
+
+        """
+        encoder_emb_inp = self.build_embed(self.char_inputs, encoder=True, name="enc")
+        print("[*] word encoded size : ", encoder_emb_inp.get_shape().as_list())
+        self.encoder_outputs = self.build_encoder(encoder_emb_inp)
+        print("[*] word encoded output size : ", self.encoder_outputs.get_shape().as_list())
+
+        decoder_emb_inp = self.build_embed(self.targets, encoder=False, name="dec")
+        print("[*] tag decoded size : ", decoder_emb_inp.get_shape().as_list())
+        decoder_outputs = self.build_decoder(decoder_emb_inp, self.encoder_outputs)
+        outputs = self.build_output(decoder_outputs)
+        print("[*] outputs size : ", outputs.get_shape().as_list())
+        """
+
+        """
+        word_embs_rnn = self._build_birnn_model(word_encoded,
+                                                seq_len=word_length,  # config["max_char_length"],
+                                                lstm_units=config["word_lstm_dim"] // 2,
+                                                last=True, scope="word_layer")
+        word_embs_rnn = tf.reshape(word_embs_rnn, (-1, config["max_word_length"],
+                                                   word_embs_rnn.get_shape().as_list()[-1]))
+        word_embs_rnn_size = word_embs_rnn.get_shape().as_list()
+        print("[*] Character Embedding RNN size : ", word_embs_rnn_size)
+
+        word_encoded += word_embs_rnn  # tf.concat([word_encoded, word_embs_rnn], axis=-1)
+        print("[*] word encoded size : ", word_encoded.get_shape().as_list())
+        """
+
+        """
+        with tf.name_scope("CharRNN"):
+            outputs = self.biLSTM_layer(word_encoded, self.word_lstm_dim, self.word_lengths, self.dropout)
+            print("[*] biLSTM size : ", outputs.get_shape().as_list())
+
+        residual_outputs = tf.layers.dense(word_encoded, 2 * self.word_lstm_dim,
+                                           kernel_initializer=self.he_uni,
+                                           kernel_regularizer=self.l2_reg)
+        outputs += residual_outputs
+        """
+
+        """
+        self.num_hidden_layers = 2
+        self.hidden_size = self.config["word_lstm_dim"]  # 256
+
+        x_1 = encoder(word_encoded, self.word_lengths,
+                      self.hidden_size, self.num_hidden_layers, self.dropout,
+                      scope="Encoder1")
+        x_2 = encoder(word_encoded, self.word_lengths,
+                      self.hidden_size, self.num_hidden_layers, self.dropout,
+                      scope="Encoder2")
+        x = tf.concat([x_1, x_2], axis=-1)
+        x = tf.nn.dropout(x, self.dropout)
+        print("[*] x size : ", x.get_shape().as_list())
+
+        """
+
+        """
+        x = word_encoded
+        for i in range(self.num_layers):
+            with tf.variable_scope("multi-head-attention-%d" % i):
+                x = multihead_attention(x,
+                                        x,
+                                        num_units=self.word_lstm_dim,
+                                        num_heads=self.num_heads,
+                                        dropout_rate=self.dropout,
+                                        is_training=config["mode"] == "train",
+                                        causality=False)
+                x = feedforward(x, num_units=[4 * self.word_lstm_dim, self.word_lstm_dim])
+
+        enc = x
+        print("[*] Encoder shape : ", enc.get_shape().as_list())
+
+        with tf.variable_scope("decoder"):
+            dec = embedding(decode_inputs,
+                            vocab_size=config["max_word_length"],
+                            num_units=self.word_lstm_dim,
+                            scale=True,
+                            scope="dec_embed")
+            print("[*] Decoder shape : ", dec.get_shape().as_list())
+            # dec = positional_encoding(dec, self.word_lstm_dim, zero_pad=False, scale=False, scope="dec_pe")
+            # print("[*] Decoder shape : ", dec.get_shape().as_list())
+
+            x = dec
+            for i in range(self.num_layers):
+                with tf.variable_scope("multi-head-attention-%d" % i):
+                    x = multihead_attention(x,
+                                            x,
+                                            num_units=self.word_lstm_dim,
+                                            num_heads=self.num_heads,
+                                            dropout_rate=self.dropout,
+                                            is_training=config["mode"] == "train",
+                                            causality=True,
+                                            scope="self-attention-%d" % i)
+
+                    x = multihead_attention(x,
+                                            enc,
+                                            num_units=self.word_lstm_dim,
+                                            num_heads=self.num_heads,
+                                            dropout_rate=self.dropout,
+                                            is_training=config["mode"] == "train",
+                                            causality=False,
+                                            scope="vanilla-attention-%d" % i)
+
+                    x = feedforward(x, num_units=[4 * self.word_lstm_dim, self.word_lstm_dim])
+
+
+
+        outputs = x
+        print("[*] outputs shape : ", outputs.get_shape().as_list())
+        """
+
+        # word_encoded = Encoder().build(word_encoded)
+
+        with tf.name_scope('deep_bidirectional_rnn'):
+            outputs, _ = deep_bidirectional_dynamic_rnn([self._dblstm_cell(self.word_lstm_dim) for _ in range(2)],
+                                                        word_encoded, sequence_length=self.word_lengths,
+                                                        scope="dbrnn-1")
+            print("[*] deep biLSTM size : ", outputs.get_shape().as_list())
+
+        # logits for tags
+        outputs = tf.reshape(outputs, (-1, outputs.get_shape().as_list()[-1]))
+        self.logits = self.project_layer(outputs)
+
+        # loss of the model
+        self.loss = self.loss_layer(self.logits, self.word_lengths)
+
+        with tf.variable_scope("optimizer", reuse=tf.AUTO_REUSE):
+            optimizer = self.config["optimizer"]
+            lr = self.config["lr"]
+            lr_decay = self.config["lr_decay"]
+
+            learning_rate = tf.train.exponential_decay(lr,
+                                                       self.global_step,
+                                                       1593 * 1,  # 1 epoch
+                                                       lr_decay,
+                                                       staircase=True)
+
+            self.lr = tf.clip_by_value(learning_rate,
+                                       clip_value_min=4e-5,
+                                       clip_value_max=lr,
+                                       name='lr-clipped')
+
+            if optimizer == "sgd":
+                # self.opt = tf.train.GradientDescentOptimizer(self.lr)
+                self.opt = tf.train.MomentumOptimizer(self.lr, momentum=.9, use_nesterov=True)
+            elif optimizer == "adam":
+                self.opt = tf.train.AdamOptimizer(self.lr, epsilon=1e-6)
+            elif optimizer == "adadelta":
+                self.opt = tf.train.AdadeltaOptimizer(self.lr, epsilon=1e-6)
+            else:
+                raise KeyError
+
+            # apply grad clip to avoid gradient explosion
+            grads_vars = self.opt.compute_gradients(self.loss)
+            capped_grads_vars = [[tf.clip_by_value(g, -self.config["clip"], self.config["clip"]), v]
+                                 for g, v in grads_vars]
+            self.train_op = self.opt.apply_gradients(capped_grads_vars, self.global_step)
+
+        # saver of the model
+        self.saver = tf.train.Saver(tf.global_variables(), max_to_keep=self.config["patience"])
+
+    def build_output(self, decoder_outputs, reuse=False):
+        with tf.variable_scope("Output", reuse=reuse):
+            logits = tf.layers.dense(decoder_outputs, self.config["num_tags"],
+                                     kernel_initializer=self.he_uni,
+                                     kernel_regularizer=self.l2_reg)
+        self.train_predictions = tf.argmax(logits[0], axis=1, name="train/pred_0")
+        return logits
+
+    def build_embed(self, inputs, encoder=True, name="embeddings"):
+        with tf.variable_scope(name):
+            # Word Embedding
+            # embedding_encoder = tf.get_variable(
+            #     "embedding_encoder", [self.config["num_chars"], self.char_lstm_dim], tf.float32)
+            if encoder:
+                embedding_encoder = self.embedding_layer(self.char_inputs, self.num_chars, self.char_dim)
+                embedding_encoder = self.get_word_representation(embedding_encoder)
+                encoded_inputs = embedding_encoder
+            else:
+                embedding_decoder = tf.get_variable(
+                    "embedding_decoder", [self.config["num_tags"], self.word_lstm_dim], tf.float32)
+                encoded_inputs = tf.nn.embedding_lookup(embedding_decoder, inputs)
+
+            # Positional Encoding
+            """
+            with tf.variable_scope("positional-encoding"):
+                positional_encoded = self._positional_encoding(inputs,
+                                                               self.word_lstm_dim,
+                                                               self.config["max_word_length"],
+                                                               dtype=tf.float32)
+            """
+
+            # Add
+            # position_inputs = tf.tile(tf.range(0, self.config["max_word_length"]), [self.batch_size])
+            # position_inputs = tf.reshape(position_inputs,
+            #                              [self.batch_size, self.config["max_word_length"]])
+            # batch_size x [0, 1, 2, ..., n]
+
+            return tf.nn.dropout(encoded_inputs, self.dropout)
+
+    def build_encoder(self, encoder_emb_inp, reuse=False):
+        with tf.variable_scope("Encoder", reuse=reuse):
+            encoder = Encoder(num_layers=self.num_layers,
+                              num_heads=self.num_heads,
+                              linear_key_dim=self.linear_key_dim,
+                              linear_value_dim=self.linear_value_dim,
+                              model_dim=self.word_lstm_dim,
+                              ffn_dim=self.ffn_dim)
+            return encoder.build(encoder_emb_inp)
+
+    def build_decoder(self, decoder_emb_inp, encoder_outputs, reuse=False):
+        with tf.variable_scope("Decoder", reuse=reuse):
+            decoder = Decoder(num_layers=self.num_layers,
+                              num_heads=self.num_heads,
+                              linear_key_dim=self.linear_key_dim,
+                              linear_value_dim=self.linear_value_dim,
+                              model_dim=self.word_lstm_dim,
+                              ffn_dim=self.ffn_dim)
+            return decoder.build(decoder_emb_inp, encoder_outputs)
+
+    def _dblstm_cell(self, dims):
+        cell = tf.contrib.rnn.CoupledInputForgetGateLSTMCell(
+            dims,
+            use_peepholes=True,
+            initializer=self.he_uni,
+            state_is_tuple=True)
+        # cell = tf.nn.rnn_cell.GRUCell(dims, kernel_initializer=self.he_uni)
+        # cell = tf.contrib.rnn.NASCell(dims)
+        cell = tf.contrib.rnn.HighwayWrapper(cell)
+        # cell = tf.contrib.rnn.DropoutWrapper(cell, variational_recurrent=True, dtype=tf.float32,
+        #                                      output_keep_prob=self.dropout)
+        cell = tf.contrib.rnn.DropoutWrapper(cell, input_keep_prob=self.dropout, output_keep_prob=self.dropout)
+        return tf.contrib.rnn.ResidualWrapper(cell)
+
+    @staticmethod
+    def _char_embedding_init(dim):
+        scale = tf.sqrt(3. / dim)
+        return tf.random_uniform_initializer(-scale, scale)
+
+    def _build_birnn_model(self, target, seq_len, lstm_units, last=False, scope="layer"):
+        with tf.variable_scope("forward_" + scope):
+            lstm_fw_cell = self._dblstm_cell(lstm_units)  # _cell(lstm_units)
+
+        with tf.variable_scope("backward_" + scope):
+            lstm_bw_cell = self._dblstm_cell(lstm_units)  # _cell(lstm_units)
+
+        with tf.variable_scope("birnn-lstm_" + scope):
+            _output = tf.nn.bidirectional_dynamic_rnn(lstm_fw_cell, lstm_bw_cell,
+                                                      dtype=tf.float32,
+                                                      inputs=target, sequence_length=seq_len, scope="rnn_" + scope)
+            if last:
+                _, ((_, output_fw), (_, output_bw)) = _output
+                outputs = tf.concat([output_fw, output_bw], axis=1)
+                outputs = tf.reshape(outputs, shape=[-1, self.config["max_word_length"], 2 * lstm_units])
+            else:
+                (output_fw, output_bw), _ = _output
+                outputs = tf.concat([output_fw, output_bw], axis=2)
+                outputs = tf.reshape(outputs, shape=[-1, outputs.get_shape().as_list()[-1]])
+        return outputs
+
+    @staticmethod
+    def _position_encoding(sentence_size, embedding_size):
+        """
+
+        encoded_vec = np.array([pos / np.power(10000, 2 * i / embedding_size)
+                                for pos in range(sentence_size) for i in range(embedding_size)])
+        encoded_vec[::2] = np.sin(encoded_vec[::2])
+        encoded_vec[1::2] = np.cos(encoded_vec[1::2])
+        return tf.convert_to_tensor(encoded_vec.reshape([sentence_size, embedding_size]), dtype=tf.float32)
+        """
+        encoding = np.ones((embedding_size, sentence_size), dtype=np.float32)
+        ls = sentence_size + 1
+        le = embedding_size + 1
+        for i in range(1, le):
+            for j in range(1, ls):
+                encoding[i - 1, j - 1] = (i - (le - 1) / 2) * (j - (ls - 1) / 2)
+        encoding = 1 + 4 * encoding / embedding_size / sentence_size
+        return np.transpose(encoding)
+
+    def get_word_representation(self, embedding):
+        position_encoding_mat = self._position_encoding(self.config["max_char_length"], self.char_dim)
+        # position_encoded = tf.reduce_sum(embedding * position_encoding_mat, 2)
+        # return position_encoded
+        # position_inputs = tf.tile(tf.range(0, self.config["max_char_length"]), [embedding.get_shape().as_list()[0]])
+        # position_inputs = tf.reshape(position_inputs, (-1, self.config["max_char_length"]))
+        # x = tf.add(embedding, tf.nn.embedding_lookup(position_encoding_mat, position_inputs))
+        position_encoded = tf.reduce_sum(embedding * position_encoding_mat, 2)
+        return tf.nn.dropout(position_encoded, self.dropout)
+
+    def embedding_layer(self, char_inputs, vocab_size, units, scope="char_embedding"):
+        with tf.variable_scope(scope, reuse=tf.AUTO_REUSE), tf.device('/cpu:0'):
+            self.char_lookup = tf.get_variable(
+                name="char_embedding",
+                shape=[vocab_size, units],
+                initializer=self._char_embedding_init(units)
+            )
+            outputs = tf.nn.embedding_lookup(self.char_lookup, char_inputs)
+        return outputs
+
+    def biLSTM_layer(self, lstm_inputs, lstm_dim, lengths, dropout_rate, name=None):
+        """
+        :param lstm_inputs: [batch_size, num_steps, emb_size]
+        :return: [batch_size, num_steps, 2 * lstm_dim]
+        """
+        with tf.variable_scope("char_BiLSTM" if not name else name, reuse=tf.AUTO_REUSE):
+            lstm_cell = {}
+            for direction in ["forward", "backward"]:
+                with tf.variable_scope(direction, reuse=tf.AUTO_REUSE):
+                    cell = tf.contrib.rnn.CoupledInputForgetGateLSTMCell(
+                        lstm_dim,
+                        use_peepholes=True,
+                        initializer=self.he_uni,
+                        state_is_tuple=True)
+                    cell = tf.contrib.rnn.HighwayWrapper(cell)
+                    cell = tf.contrib.rnn.DropoutWrapper(cell,
+                                                         input_keep_prob=dropout_rate,
+                                                         output_keep_prob=dropout_rate)
+                    lstm_cell[direction] = cell
+                    # lstm_cell[direction] = tf.contrib.rnn.ResidualWrapper(cell)
+
+            outputs, final_states = tf.nn.bidirectional_dynamic_rnn(
+                lstm_cell["forward"],
+                lstm_cell["backward"],
+                lstm_inputs,
+                dtype=tf.float32,
+                sequence_length=lengths)
+
+        return tf.concat(outputs, axis=2)
+
+    def project_layer(self, lstm_outputs, name=None):
+        """
+        hidden layer between lstm layer and logits
+        :param lstm_outputs: [batch_size, num_steps, emb_size]
+        :return: [batch_size, num_steps, num_tags]
+        """
+        with tf.variable_scope("project" if not name else name, reuse=tf.AUTO_REUSE):
+            with tf.variable_scope("hidden", reuse=tf.AUTO_REUSE):
+                x = tf.layers.dense(lstm_outputs, units=lstm_outputs.get_shape().as_list()[-1] // 2,
+                                    kernel_initializer=self.he_uni,
+                                    kernel_regularizer=self.l2_reg,
+                                    bias_initializer=tf.zeros_initializer())
+                x = tf.nn.leaky_relu(x, alpha=0.2)
+                # x = tf.nn.tanh(x)
+
+            # project to score of tags
+            with tf.variable_scope("logits", reuse=tf.AUTO_REUSE):
+                x = tf.layers.dense(x, units=self.num_tags,
+                                    kernel_initializer=self.he_uni,
+                                    kernel_regularizer=self.l2_reg,
+                                    bias_initializer=tf.zeros_initializer())
+
+                pred = tf.reshape(x, (-1, self.word_num_steps, self.num_tags))
+
+            return pred
+
+    def loss_layer(self, project_logits, lengths, name=None):
+        """
+        calculate crf loss
+        :param project_logits: [1, num_steps, num_tags]
+        :return: scalar loss
+        """
+        with tf.variable_scope("crf_loss" if not name else name, reuse=tf.AUTO_REUSE):
+            small = -1000.0
+
+            # pad logits for crf loss
+            start_logits = tf.concat([
+                small * tf.ones(shape=[self.batch_size, 1, self.num_tags]),
+                tf.zeros(shape=[self.batch_size, 1, 1])
+            ], axis=-1)
+            pad_logits = tf.cast(small * tf.ones([self.batch_size, self.word_num_steps, 1]), dtype=tf.float32)
+
+            logits = tf.concat([project_logits, pad_logits], axis=-1)
+            logits = tf.concat([start_logits, logits], axis=1)
+            targets = tf.concat(
+                [tf.cast(self.num_tags * tf.ones([self.batch_size, 1]), tf.int32), self.targets], axis=-1)
+
+            self.trans = tf.get_variable(
+                "transitions",
+                shape=[self.num_tags + 1, self.num_tags + 1],
+                initializer=self.he_uni, regularizer=self.l2_reg)
+
+            log_likelihood, self.trans = crf_log_likelihood(
+                inputs=logits,
+                tag_indices=targets,
+                transition_params=self.trans,
+                sequence_lengths=lengths + 1)
+            return tf.reduce_mean(-log_likelihood)
+
+    def create_feed_dict(self, is_train, batch):
+        """
+        :param is_train: Flag, True for train batch
+        :param batch: list train/evaluate data
+        :return: structured data to feed
+        """
+        _, chars, tags = batch
+        # chars = np.array(chars)
+        # char_inputs = np.pad(chars, pad_width=((0, self.config["batch_size"] - chars.shape[0]),
+        #                                        (0, self.config["max_word_length"] - chars.shape[1]), (0, 0)),
+        #                      mode='constant',
+        #                      constant_values=(0, 0))
+        feed_dict = {
+            self.char_inputs: np.array(chars),  # char_inputs,
+            self.dropout: 1.0,
+        }
+
+        # print('chars')
+        # print(chars)
+        # print('after chars')
+        # print(feed_dict[self.char_inputs])
+
+        if is_train:
+            # tags = np.asarray(tags)
+            # feed_dict[self.targets] = np.pad(tags, pad_width=((0, self.config["batch_size"] - tags.shape[0]),
+            #                                                   (0, self.config["max_word_length"] - tags.shape[1])),
+            #                                  mode='constant', constant_values=0)
+            feed_dict[self.targets] = np.asarray(tags)
+            feed_dict[self.dropout] = self.config["dropout_keep"]
+            # print('tags')
+            # print(tags)
+            # print('after tags')
+            # print(feed_dict[self.targets])
+        # else:
+        #     feed_dict[self.targets] = np.zeros((char_inputs.shape[0], self.config["max_word_length"]), np.int32)
+
+        return feed_dict
+
+    def run_step(self, sess, is_train, batch):
+        """
+        :param sess: session to run the batch
+        :param is_train: a flag indicate if it is a train batch
+        :param batch: a dict containing batch data
+        :return: batch result, loss of the batch or logits
+        """
+        feed_dict = self.create_feed_dict(is_train, batch)
+
+        if is_train:
+            global_step, loss, _ = sess.run(
+                [self.global_step, self.loss, self.train_op],
+                feed_dict)
+            return global_step, loss
+        else:
+            lengths, logits = sess.run([self.word_lengths, self.logits], feed_dict)
+            return lengths, logits
+
+    def decode(self, logits, lengths, matrix):
+        """
+        :param logits: [batch_size, num_steps, num_tags]float32, logits
+        :param lengths: [batch_size]int32, real length of each sequence
+        :param matrix: transaction matrix for inference
+        :return:
+        """
+        # inference final labels usa viterbi Algorithm
+        paths = []
+        small = -1000.0
+        start = np.asarray([[small] * self.num_tags + [0]])
+        for score, length in zip(logits, lengths):
+            score = score[:length]
+            pad = small * np.ones([length, 1])
+            logits = np.concatenate([score, pad], axis=1)
+            logits = np.concatenate([start, logits], axis=0)
+            path, _ = viterbi_decode(logits, matrix)
+
+            paths.append(path[1:])
+        return paths
+
+    def evaluate_model(self, sess, data_manager, id_to_tag):
+        """
+        :param sess: session  to run the model
+        :param data: list of data
+        :param id_to_tag: index to tag name
+        :return: evaluate result
+        """
+        results = []
+        trans = self.trans.eval(session=sess)
+        for batch in data_manager.iter_batch():
+            strings = batch[0]
+            tags = batch[-1]
+            lengths, scores = self.run_step(sess, False, batch)
+            batch_paths = self.decode(scores, lengths, trans)
+            for i in range(len(strings)):
+                result = []
+                string = strings[i][:lengths[i]]
+                gold = [id_to_tag[int(x)] for x in tags[i][:lengths[i]]]
+                pred = [id_to_tag[int(x)] for x in batch_paths[i][:lengths[i]]]
+                for char, gold, pred in zip(string, gold, pred):
+                    result.append(" ".join([''.join(char), gold, pred]))
+                results.append(result)
+        return results
+
+    def evaluate_lines(self, sess, inputs, id_to_tag):
+        trans = self.trans.eval(session=sess)
+        lengths, scores = self.run_step(sess, False, inputs)
+        # batch_paths = []
+        # for i in range(0, len(inputs), self.config["batch_size"]):
+        #     batch_paths.append(*self.decode(scores[i: i + self.config["batch_size"], :, :],
+        #                                     lengths[i: i + self.config["batch_size"]], trans))
+        batch_paths = self.decode(scores, lengths, trans)
+        total_tags = [[id_to_tag[idx] for idx in path] for path in batch_paths]
+        return [(0.0, tag) for tag in total_tags]
