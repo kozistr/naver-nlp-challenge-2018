@@ -7,6 +7,6 @@ setup(
     version='1',
     description='SRL_NSML_Baseline',
     install_requires=[
-        'tensorflow-gpu==1.11.0',
+        'tensorflow-gpu==1.15.4',
     ]
 )
